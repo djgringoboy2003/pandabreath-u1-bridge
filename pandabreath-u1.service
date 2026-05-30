@@ -1,0 +1,20 @@
+[Unit]
+Description=Snapmaker U1 PandaBreath Chamber Control bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+# Adjust User, WorkingDirectory and ExecStart paths to wherever you cloned the
+# repo and created the virtualenv. Example assumes /opt/pandabreath-u1-bridge.
+User=YOUR_USER
+WorkingDirectory=/opt/pandabreath-u1-bridge
+ExecStart=/opt/pandabreath-u1-bridge/.venv/bin/python /opt/pandabreath-u1-bridge/pandabreath_u1_bridge.py --config /opt/pandabreath-u1-bridge/config.yaml
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+WatchdogSec=30
+NotifyAccess=main
+
+[Install]
+WantedBy=multi-user.target

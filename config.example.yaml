@@ -1,0 +1,90 @@
+# PandaBreath U1 Bridge — example configuration.
+# Copy this to config.yaml and edit for your setup:
+#   cp config.example.yaml config.yaml
+#
+# Safe by default: dry_run is true, so the bridge logs the chamber decisions it
+# *would* make without commanding the PandaBreath. Set dry_run: false once you
+# have verified the readings and material map look correct for your printer.
+
+printer:
+  # Moonraker API of your Snapmaker U1.
+  moonraker_url: "http://YOUR_PRINTER_IP:7125"
+  request_timeout_seconds: 5
+  poll_interval_seconds: 5
+  failed_poll_limit: 2
+
+panda_breath:
+  # Hostname or IP of the BIQU PandaBreath device. mDNS (.local) works if your
+  # network resolves it; a static lease + IP is more reliable.
+  ip: "pandabreath.local"
+  web_url: "http://pandabreath.local"
+  connect_timeout_seconds: 5
+  command_timeout_seconds: 5
+
+control:
+  enabled: true
+  dry_run: true            # set false to actually command the heater
+  default_target_c: 0
+  absolute_safety_limit_c: 70
+  overshoot_stop_buffer_c: 2
+  overshoot_resume_buffer_c: 2
+  turn_off_when_idle: true
+  turn_off_when_error: true
+  turn_off_on_shutdown: true
+
+pause:
+  hold_heat_minutes: 10
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8081
+  allow_controls: false
+  manual_off_minutes: 30
+  # Optional quick-link buttons on the dashboard. Leave blank to hide them.
+  fluidd_url: ""           # e.g. "http://YOUR_PRINTER_IP"
+
+safety:
+  # Independent over-temperature shutoffs. u1_cavity_limit_c guards the U1
+  # enclosure/motherboard using the printer's [temperature_sensor cavity];
+  # keep it below the RK3562 SoC's 85 C throttle point.
+  absolute_safety_limit_c: 70
+  pandabreath_limit_c: 70
+  u1_cavity_limit_c: 70
+
+temperature_control:
+  # pandabreath | u1_cavity | max | average
+  strategy: "pandabreath"
+
+cooldown:
+  monitor_minutes: 10
+  fan_only_supported: false
+
+history:
+  enabled: true
+  file: "logs/history.jsonl"
+  dashboard_points: 240
+  max_lines: 10000
+
+sessions:
+  enabled: true
+  file: "logs/sessions.jsonl"
+  dashboard_sessions: 20
+
+# Chamber target (C) per material. 0 = no chamber heating. Tune to taste.
+materials:
+  PLA: 0
+  TPU: 0
+  PETG: 38
+  ABS: 55
+  ASA: 55
+  PC: 55
+  PA: 50
+  NYLON: 50
+  DEFAULT: 0
+
+logging:
+  level: "INFO"
+  file: "logs/pandabreath-u1.log"
+  max_bytes: 1048576
+  backup_count: 5

@@ -1,0 +1,19 @@
+# Local config (copy from config.example.yaml)
+config.yaml
+
+# Runtime data
+logs/
+*.jsonl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+*.swp
