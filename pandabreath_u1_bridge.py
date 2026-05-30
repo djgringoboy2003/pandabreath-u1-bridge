@@ -619,7 +619,10 @@ class PandaBreathClient:
                 data = json.loads(message)
                 self._deep_merge(merged, data)
                 settings = merged.get("settings", {})
-                if isinstance(settings, dict) and settings.get("warehouse_temper") is not None:
+                if isinstance(settings, dict) and (
+                    settings.get("cal_warehouse_temp") is not None
+                    or settings.get("warehouse_temper") is not None
+                ):
                     break
             self.last_state = merged
             return merged
@@ -635,11 +638,12 @@ class PandaBreathClient:
     def get_current_temperature(self) -> int | None:
         state = self.last_state
         settings = state.get("settings", {}) if isinstance(state, dict) else {}
-        value = settings.get("warehouse_temper")
+        # Prefer the device's ADC-calibrated reading; fall back to the raw one.
+        value = settings.get("cal_warehouse_temp", settings.get("warehouse_temper"))
         if value is None:
             return None
         try:
-            return int(value)
+            return int(round(float(value)))
         except (TypeError, ValueError):
             return None
 
@@ -660,22 +664,42 @@ class PandaBreathClient:
         if target_c <= 0:
             self.heater_off()
             return
-        payload = {"settings": {"set_temp": int(target_c), "work_mode": 2, "work_on": True}}
-        self._send(payload, f"set target {target_c}C")
+        # Discrete, ordered writes that match the stock web UI's update order for
+        # device-firmware (v1.0.3) compatibility — the device applies separate
+        # setting writes more reliably than one combined payload. The leading
+        # isrunning:0 clears any active drying/auto cycle before commanding
+        # manual (work_mode 2) heat.
+        messages = [
+            {"settings": {"isrunning": 0}},
+            {"settings": {"work_mode": 2}},
+            {"settings": {"set_temp": int(target_c)}},
+            {"settings": {"work_on": True}},
+        ]
+        self._send(messages, f"set target {target_c}C")
 
     def heater_off(self) -> None:
-        self._send({"settings": {"work_on": False}}, "heater off")
+        # isrunning:0 first so an active drying/auto cycle is actually stopped,
+        # not just the manual heater flag cleared.
+        messages = [
+            {"settings": {"isrunning": 0}},
+            {"settings": {"work_on": False}},
+        ]
+        self._send(messages, "heater off")
 
-    def _send(self, payload: dict[str, Any], reason: str) -> None:
+    def _send(self, messages: list[dict[str, Any]], reason: str) -> None:
         if self.dry_run:
-            logging.info("DRY-RUN PandaBreath command suppressed (%s): %s", reason, payload)
+            logging.info("DRY-RUN PandaBreath command suppressed (%s): %s", reason, messages)
             return
-        asyncio.run(self._send_ws(payload, reason))
+        asyncio.run(self._send_ws(messages, reason))
 
-    async def _send_ws(self, payload: dict[str, Any], reason: str) -> None:
+    async def _send_ws(self, messages: list[dict[str, Any]], reason: str) -> None:
+        # Send the ordered settings messages over a single connection, in order.
         async with websockets.connect(self.ws_url, open_timeout=self.connect_timeout) as ws:
-            await asyncio.wait_for(ws.send(json.dumps(payload)), timeout=self.command_timeout)
-            logging.info("PandaBreath command sent (%s): %s", reason, payload)
+            for payload in messages:
+                await asyncio.wait_for(ws.send(json.dumps(payload)), timeout=self.command_timeout)
+            logging.info(
+                "PandaBreath command sent (%s): %d message(s): %s", reason, len(messages), messages
+            )
 
     def command_matches_state(self, target_c: int) -> tuple[bool, str]:
         if self.dry_run:

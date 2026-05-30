@@ -196,14 +196,76 @@ def test_live_client_uses_boolean_work_on(monkeypatch):
         }
     )
 
-    async def fake_send_ws(payload, _reason):
-        sent.append(payload)
+    async def fake_send_ws(messages, _reason):
+        sent.append(messages)
 
     monkeypatch.setattr(client, "_send_ws", fake_send_ws)
     client.set_target_temperature(38)
     client.heater_off()
-    assert sent[0]["settings"]["work_on"] is True
-    assert sent[1]["settings"]["work_on"] is False
+    set_msgs, off_msgs = sent[0], sent[1]
+    # Final write of the set sequence enables the heater with a real bool.
+    assert set_msgs[-1]["settings"]["work_on"] is True
+    # Final write of the off sequence disables it with a real bool.
+    assert off_msgs[-1]["settings"]["work_on"] is False
+
+
+def test_set_target_sends_ordered_discrete_writes(monkeypatch):
+    sent = []
+    client = PandaBreathClient(
+        {
+            "panda_breath": {"web_url": "http://127.0.0.1"},
+            "control": {"dry_run": False},
+        }
+    )
+
+    async def fake_send_ws(messages, _reason):
+        sent.append(messages)
+
+    monkeypatch.setattr(client, "_send_ws", fake_send_ws)
+    client.set_target_temperature(45)
+    messages = sent[0]
+    # Each setting is its own message, in the stock web UI order, led by
+    # isrunning:0 to clear any active drying/auto cycle.
+    keys = [next(iter(m["settings"])) for m in messages]
+    assert keys == ["isrunning", "work_mode", "set_temp", "work_on"]
+    assert messages[0]["settings"]["isrunning"] == 0
+    assert messages[1]["settings"]["work_mode"] == 2
+    assert messages[2]["settings"]["set_temp"] == 45
+    assert messages[3]["settings"]["work_on"] is True
+
+
+def test_heater_off_clears_isrunning_first(monkeypatch):
+    sent = []
+    client = PandaBreathClient(
+        {
+            "panda_breath": {"web_url": "http://127.0.0.1"},
+            "control": {"dry_run": False},
+        }
+    )
+
+    async def fake_send_ws(messages, _reason):
+        sent.append(messages)
+
+    monkeypatch.setattr(client, "_send_ws", fake_send_ws)
+    client.heater_off()
+    messages = sent[0]
+    assert messages[0]["settings"]["isrunning"] == 0
+    assert messages[-1]["settings"]["work_on"] is False
+
+
+def test_get_current_temperature_prefers_calibrated():
+    client = PandaBreathClient(
+        {"panda_breath": {"web_url": "http://127.0.0.1"}, "control": {"dry_run": True}}
+    )
+    # Calibrated reading wins over the raw one and is rounded to whole C.
+    client.last_state = {"settings": {"cal_warehouse_temp": 23.6, "warehouse_temper": 21}}
+    assert client.get_current_temperature() == 24
+    # Falls back to the raw reading when no calibrated value is present.
+    client.last_state = {"settings": {"warehouse_temper": 21}}
+    assert client.get_current_temperature() == 21
+    # No reading at all -> None.
+    client.last_state = {"settings": {}}
+    assert client.get_current_temperature() is None
 
 
 def test_deep_merge_preserves_incremental_status():
