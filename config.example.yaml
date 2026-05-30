@@ -20,6 +20,10 @@ panda_breath:
   web_url: "http://pandabreath.local"
   connect_timeout_seconds: 5
   command_timeout_seconds: 5
+  # The bridge keeps one persistent WebSocket open and treats it as healthy only
+  # if a frame (state push or pong) arrived within stale_seconds; otherwise it
+  # forces the heater off until the connection recovers.
+  stale_seconds: 30
 
 control:
   enabled: true

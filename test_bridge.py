@@ -1,4 +1,7 @@
+import asyncio
+import json
 import signal
+import time
 
 import pytest
 
@@ -266,6 +269,98 @@ def test_get_current_temperature_prefers_calibrated():
     # No reading at all -> None.
     client.last_state = {"settings": {}}
     assert client.get_current_temperature() is None
+
+
+def _client(dry_run=False):
+    return PandaBreathClient(
+        {"panda_breath": {"web_url": "http://127.0.0.1"}, "control": {"dry_run": dry_run}}
+    )
+
+
+def test_is_fresh_requires_connected_and_recent():
+    client = _client()
+    client.stale_seconds = 30
+    # Not connected -> never fresh.
+    client._connected = False
+    client._last_message_at = time.time()
+    assert client.is_fresh() is False
+    # Connected and a recent frame -> fresh.
+    client._connected = True
+    client._last_message_at = time.time()
+    assert client.is_fresh() is True
+    # Connected but last frame is older than stale_seconds -> stale.
+    client._last_message_at = time.time() - 31
+    assert client.is_fresh() is False
+
+
+def test_send_records_desired_for_resend_on_reconnect():
+    # Live client without a started connection -> falls back to one-shot _send_ws,
+    # but the desired state must be recorded for the reconnect resend regardless.
+    sent = []
+    client = _client(dry_run=False)
+
+    async def fake_send_ws(messages, _reason):
+        sent.append(messages)
+
+    client._send_ws = fake_send_ws  # type: ignore[assignment]
+    client.set_target_temperature(38)
+    assert client._desired[-1] == {"settings": {"work_on": True}}
+    client.heater_off()
+    assert client._desired == [
+        {"settings": {"isrunning": 0}},
+        {"settings": {"work_on": False}},
+    ]
+
+
+def test_dry_run_still_records_desired():
+    client = _client(dry_run=True)
+    client.set_target_temperature(45)
+    # Even suppressed, the desired command is remembered so a later live
+    # reconnect can apply it.
+    assert client._desired[2] == {"settings": {"set_temp": 45}}
+
+
+def test_send_failure_does_not_raise():
+    # A failing transport must not propagate out of _send (best-effort + resend).
+    client = _client(dry_run=False)
+
+    async def boom(_messages, _reason):
+        raise OSError("connection refused")
+
+    client._send_ws = boom  # type: ignore[assignment]
+    # Should log a warning and return, not raise.
+    client.heater_off()
+    assert client._desired == [
+        {"settings": {"isrunning": 0}},
+        {"settings": {"work_on": False}},
+    ]
+
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, text):
+        self.sent.append(text)
+
+
+def test_send_over_sends_all_messages_in_order():
+    client = _client(dry_run=False)
+    ws = _FakeWS()
+    messages = [
+        {"settings": {"isrunning": 0}},
+        {"settings": {"work_mode": 2}},
+        {"settings": {"set_temp": 50}},
+        {"settings": {"work_on": True}},
+    ]
+    asyncio.run(client._send_over(ws, messages))
+    assert [json.loads(s) for s in ws.sent] == messages
+
+
+def test_send_over_raises_without_connection():
+    client = _client(dry_run=False)
+    with pytest.raises(RuntimeError):
+        asyncio.run(client._send_over(None, [{"settings": {"work_on": False}}]))
 
 
 def test_deep_merge_preserves_incremental_status():

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -589,6 +590,9 @@ class MoonrakerClient:
 
 
 class PandaBreathClient:
+    # Delay between reconnect attempts for the persistent connection.
+    RECONNECT_DELAY = 5.0
+
     def __init__(self, config: dict[str, Any]) -> None:
         panda = config["panda_breath"]
         control = config["control"]
@@ -596,36 +600,133 @@ class PandaBreathClient:
         self.ws_url = self.web_url.replace("http://", "ws://").replace("https://", "wss://") + "/ws"
         self.connect_timeout = int(panda.get("connect_timeout_seconds", 5))
         self.command_timeout = int(panda.get("command_timeout_seconds", 5))
+        # A persistent connection is healthy only if a frame (state push or pong)
+        # arrived within this window; otherwise it is treated as stale/down.
+        self.stale_seconds = int(panda.get("stale_seconds", 30))
         self.dry_run = bool(control.get("dry_run", True))
         self.last_state: dict[str, Any] = {}
+        # Persistent-connection machinery (idle until start()).
+        self._lock = threading.Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._conn_task: asyncio.Task[Any] | None = None
+        self._ws: Any = None
+        self._connected = False
+        self._last_message_at = 0.0
+        self._desired: list[dict[str, Any]] | None = None
+        self._stop = threading.Event()
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
 
     def check_status(self) -> dict[str, Any]:
-        response = requests.get(self.web_url, timeout=self.connect_timeout)
-        response.raise_for_status()
-        state = asyncio.run(self.get_state())
-        logging.info("PandaBreath status ok; dry_run=%s", self.dry_run)
-        return state
+        """Start the persistent connection and wait briefly for first state."""
+        self.start()
+        deadline = time.time() + max(self.connect_timeout, 10)
+        while time.time() < deadline:
+            if self.is_fresh():
+                logging.info("PandaBreath status ok; dry_run=%s", self.dry_run)
+                return self.snapshot_state()
+            time.sleep(0.25)
+        logging.warning("PandaBreath did not report state within the startup window")
+        return self.snapshot_state()
 
-    async def get_state(self) -> dict[str, Any]:
-        async with websockets.connect(self.ws_url, open_timeout=self.connect_timeout) as ws:
-            merged: dict[str, Any] = {}
-            deadline = time.time() + self.command_timeout
-            while time.time() < deadline:
-                timeout = max(0.1, min(1.0, deadline - time.time()))
-                try:
-                    message = await asyncio.wait_for(ws.recv(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    break
-                data = json.loads(message)
-                self._deep_merge(merged, data)
-                settings = merged.get("settings", {})
-                if isinstance(settings, dict) and (
-                    settings.get("cal_warehouse_temp") is not None
-                    or settings.get("warehouse_temper") is not None
-                ):
-                    break
-            self.last_state = merged
-            return merged
+    def snapshot_state(self) -> dict[str, Any]:
+        with self._lock:
+            return copy.deepcopy(self.last_state)
+
+    def is_fresh(self) -> bool:
+        """True if connected and a frame arrived within stale_seconds."""
+        with self._lock:
+            if not self._connected:
+                return False
+            return (time.time() - self._last_message_at) < self.stale_seconds
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._thread_main, name="panda-ws", daemon=True)
+        self._thread.start()
+        logging.info("PandaBreath persistent connection thread started")
+
+    def stop(self) -> None:
+        self._stop.set()
+        loop = self._loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=5)
+        self._thread = None
+
+    def _thread_main(self) -> None:
+        loop = asyncio.new_event_loop()
+        self._loop = loop
+        asyncio.set_event_loop(loop)
+        self._conn_task = loop.create_task(self._run_connection())
+        try:
+            loop.run_forever()
+        finally:
+            self._conn_task.cancel()
+            try:
+                loop.run_until_complete(asyncio.gather(self._conn_task, return_exceptions=True))
+            except Exception:  # noqa: BLE001
+                pass
+            loop.close()
+            self._loop = None
+
+    async def _run_connection(self) -> None:
+        """Maintain one persistent connection; reconnect on any error and
+        re-send the last desired command so the device stays in sync."""
+        while not self._stop.is_set():
+            try:
+                async with websockets.connect(
+                    self.ws_url,
+                    open_timeout=self.connect_timeout,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
+                    with self._lock:
+                        self._ws = ws
+                        self._connected = True
+                        self._last_message_at = time.time()
+                        desired = self._desired
+                    logging.info("PandaBreath persistent connection established")
+                    if desired is not None and not self.dry_run:
+                        try:
+                            await self._send_over(ws, desired)
+                            logging.info("PandaBreath re-sent desired state after connect")
+                        except Exception as exc:  # noqa: BLE001
+                            logging.warning("PandaBreath resend after connect failed: %s", exc)
+                    async for message in ws:
+                        try:
+                            data = json.loads(message)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(data, dict):
+                            with self._lock:
+                                self._deep_merge(self.last_state, data)
+                                self._last_message_at = time.time()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logging.warning(
+                    "PandaBreath WS error (%s); reconnecting in %ss", exc, self.RECONNECT_DELAY
+                )
+            finally:
+                with self._lock:
+                    self._ws = None
+                    self._connected = False
+            if self._stop.is_set():
+                break
+            try:
+                await asyncio.sleep(self.RECONNECT_DELAY)
+            except asyncio.CancelledError:
+                raise
 
     @staticmethod
     def _deep_merge(target: dict[str, Any], update: dict[str, Any]) -> None:
@@ -636,10 +737,11 @@ class PandaBreathClient:
                 target[key] = value
 
     def get_current_temperature(self) -> int | None:
-        state = self.last_state
-        settings = state.get("settings", {}) if isinstance(state, dict) else {}
-        # Prefer the device's ADC-calibrated reading; fall back to the raw one.
-        value = settings.get("cal_warehouse_temp", settings.get("warehouse_temper"))
+        with self._lock:
+            state = self.last_state
+            settings = state.get("settings", {}) if isinstance(state, dict) else {}
+            # Prefer the device's ADC-calibrated reading; fall back to the raw one.
+            value = settings.get("cal_warehouse_temp", settings.get("warehouse_temper"))
         if value is None:
             return None
         try:
@@ -648,12 +750,13 @@ class PandaBreathClient:
             return None
 
     def get_control_fields(self) -> dict[str, Any]:
-        settings = self.last_state.get("settings", {}) if isinstance(self.last_state, dict) else {}
-        return {
-            "panda_set_temp_c": settings.get("set_temp"),
-            "panda_work_mode": settings.get("work_mode"),
-            "panda_work_on": settings.get("work_on"),
-        }
+        with self._lock:
+            settings = self.last_state.get("settings", {}) if isinstance(self.last_state, dict) else {}
+            return {
+                "panda_set_temp_c": settings.get("set_temp"),
+                "panda_work_mode": settings.get("work_mode"),
+                "panda_work_on": settings.get("work_on"),
+            }
 
     @staticmethod
     def has_complete_control_state(state: dict[str, Any]) -> bool:
@@ -687,26 +790,55 @@ class PandaBreathClient:
         self._send(messages, "heater off")
 
     def _send(self, messages: list[dict[str, Any]], reason: str) -> None:
+        # Record the latest desired command so it can be re-sent on reconnect.
+        with self._lock:
+            self._desired = messages
         if self.dry_run:
             logging.info("DRY-RUN PandaBreath command suppressed (%s): %s", reason, messages)
             return
-        asyncio.run(self._send_ws(messages, reason))
-
-    async def _send_ws(self, messages: list[dict[str, Any]], reason: str) -> None:
-        # Send the ordered settings messages over a single connection, in order.
-        async with websockets.connect(self.ws_url, open_timeout=self.connect_timeout) as ws:
-            for payload in messages:
-                await asyncio.wait_for(ws.send(json.dumps(payload)), timeout=self.command_timeout)
+        try:
+            if self._loop is not None and self._connected:
+                self._send_persistent(messages)
+            else:
+                # No live persistent connection (not started, or mid-reconnect):
+                # fall back to a one-shot connection.
+                asyncio.run(self._send_ws(messages, reason))
             logging.info(
                 "PandaBreath command sent (%s): %d message(s): %s", reason, len(messages), messages
             )
+        except Exception as exc:  # noqa: BLE001
+            # Best-effort: the desired state is recorded and will be re-sent on
+            # the next (re)connect, so a transient failure is not fatal.
+            logging.warning(
+                "PandaBreath send failed (%s): %s; will re-send on reconnect", reason, exc
+            )
+
+    def _send_persistent(self, messages: list[dict[str, Any]]) -> None:
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("PandaBreath event loop not running")
+        fut = asyncio.run_coroutine_threadsafe(self._send_over(self._ws, messages), loop)
+        fut.result(timeout=self.command_timeout * max(1, len(messages)) + 2)
+
+    async def _send_over(self, ws: Any, messages: list[dict[str, Any]]) -> None:
+        if ws is None:
+            raise RuntimeError("no active PandaBreath connection")
+        for payload in messages:
+            await asyncio.wait_for(ws.send(json.dumps(payload)), timeout=self.command_timeout)
+
+    async def _send_ws(self, messages: list[dict[str, Any]], reason: str) -> None:
+        # One-shot fallback: open a connection, send the ordered messages, close.
+        async with websockets.connect(self.ws_url, open_timeout=self.connect_timeout) as ws:
+            await self._send_over(ws, messages)
 
     def command_matches_state(self, target_c: int) -> tuple[bool, str]:
         if self.dry_run:
             return True, "dry-run"
-        if not self.has_complete_control_state(self.last_state):
+        with self._lock:
+            state = copy.deepcopy(self.last_state)
+        if not self.has_complete_control_state(state):
             return False, "control state incomplete"
-        settings = self.last_state.get("settings", {})
+        settings = state.get("settings", {})
         if target_c <= 0:
             actual_on = settings.get("work_on")
             return actual_on in (0, False), f"work_on={actual_on}"
@@ -1023,6 +1155,10 @@ class ChamberBridge:
             except Exception as exc:  # noqa: BLE001
                 logging.error("Failed to turn PandaBreath off during shutdown: %s", exc)
                 self.status.update(last_error=f"shutdown heater_off failed: {exc}")
+        try:
+            self.panda.stop()
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to stop PandaBreath connection cleanly: %s", exc)
         self.stop_dashboard()
 
     def start_dashboard(self) -> None:
@@ -1107,7 +1243,7 @@ class ChamberBridge:
         logging.debug("Initial PandaBreath state: %s", state)
         self.status.update(
             service="running",
-            pandabreath_ok=True,
+            pandabreath_ok=self.panda.is_fresh(),
             chamber_temp_c=self.panda.get_current_temperature(),
             dry_run=self.panda.dry_run,
         )
@@ -1161,19 +1297,18 @@ class ChamberBridge:
                 _configured_target,
             )
             self.last_mixed_material_warning = snapshot.material
-        try:
-            asyncio.run(self.panda.get_state())
+        if self.panda.is_fresh():
             current_temp = self.panda.get_current_temperature()
             self.status.update(pandabreath_ok=True, chamber_temp_c=current_temp)
-        except Exception as exc:  # noqa: BLE001
-            logging.error("PandaBreath status check failed; turning heater off: %s", exc)
+        else:
+            logging.error("PandaBreath connection stale or down; turning heater off")
             self.panda.heater_off()
             self.last_target = 0
             self.status.update(
                 pandabreath_ok=False,
                 selected_target_c=0,
                 decision_reason="PandaBreath unreachable",
-                last_error=f"PandaBreath status failed: {exc}",
+                last_error="PandaBreath connection stale or down",
             )
             return
 
